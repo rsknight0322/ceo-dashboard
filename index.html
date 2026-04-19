@@ -1421,31 +1421,76 @@ function closeNotesModal() {
 
 function parseMeetingText(raw) {
   const lines = raw.split('\n');
-  const myTasks = [], teamTasks = {}; // myTasks = [{text, umbrella}]
+  const myTasks = [], teamTasks = {};
   let inActionZone = false, currentOwner = null;
-  const meNames = /^(riean|my tasks?|this week|i need|action items?)/i;
-  const skipWords = /^(next|this|your|the|all|team|follow|action|about|overview|general|content|performance|refined|new|brand)/i;
+  const MY_NAME = /^(riean|me|my|i\b)/i;
+
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    const isBullet = /^[*\-•◦▸]\s/.test(trimmed) || /^\d+\.\s/.test(trimmed);
-    const text = isBullet ? trimmed.replace(/^[*\-•◦▸\d]+\.?\s+/, '').trim() : null;
+
+    // Detect "Next Steps" / "Action Items" section header (not a bullet)
+    if (/next\s*steps?|action\s*items?/i.test(trimmed) && !/^[*\-•◦▸\d]/.test(trimmed)) {
+      inActionZone = true;
+      currentOwner = null;
+      continue;
+    }
+
+    if (!inActionZone) continue;
+
+    // Is this line a bullet?
+    const isBullet = /^[*\-•◦▸]\s/.test(trimmed) || /^\d+\.\s/.test(trimmed) || /^\-\s*\[[ x]\]\s/i.test(trimmed);
+
     if (!isBullet) {
-      if (/next\s*steps?|action\s*items?/i.test(trimmed)) { inActionZone = true; currentOwner = null; continue; }
-      if (inActionZone) {
-        if (meNames.test(trimmed)) { currentOwner = 'me'; continue; }
-        const pm = trimmed.match(/^([A-Za-z]+)\s+Tasks?/i);
-        if (pm && !skipWords.test(pm[1])) {
-          currentOwner = pm[1].charAt(0).toUpperCase() + pm[1].slice(1).toLowerCase();
+      // "Name Tasks" style section header (old format fallback)
+      const pm = trimmed.match(/^([A-Za-z]+)(?:\s+Tasks?)?:?\s*$/i);
+      if (pm) {
+        const name = pm[1];
+        if (MY_NAME.test(name)) { currentOwner = 'me'; }
+        else {
+          currentOwner = name.charAt(0).toUpperCase() + name.slice(1).toLowerCase();
           if (!teamTasks[currentOwner]) teamTasks[currentOwner] = [];
-          continue;
         }
       }
+      continue;
     }
-    if (!inActionZone || !isBullet || !text || text.length < 5) continue;
-    if (currentOwner === 'me') myTasks.push({ text, umbrella: classifyTaskUmbrella(text) });
-    else if (currentOwner) teamTasks[currentOwner].push(text);
+
+    // Strip bullet/checkbox prefix
+    let text = trimmed
+      .replace(/^[*\-•◦▸]\s*\[[ x]\]\s*/i, '')
+      .replace(/^[*\-•◦▸]\s+/, '')
+      .replace(/^\d+\.\s+/, '')
+      .trim();
+
+    if (text.length < 4) continue;
+
+    // ── Granola inline format: "* Name: task text" ──────────────
+    const inlineMatch = text.match(/^([A-Za-z]+):\s+(.+)$/);
+    if (inlineMatch) {
+      const name = inlineMatch[1];
+      const task = inlineMatch[2].trim();
+      if (task.length < 4) continue;
+      if (MY_NAME.test(name)) {
+        myTasks.push({ text: task, umbrella: classifyTaskUmbrella(task) });
+      } else if (/^team$/i.test(name)) {
+        // "Team:" items are Riean's responsibility too
+        myTasks.push({ text: task, umbrella: classifyTaskUmbrella(task) });
+      } else {
+        const owner = name.charAt(0).toUpperCase() + name.slice(1).toLowerCase();
+        if (!teamTasks[owner]) teamTasks[owner] = [];
+        teamTasks[owner].push(task);
+      }
+      continue;
+    }
+
+    // Plain bullet with no inline name — use currentOwner or default to me
+    if (currentOwner === 'me' || currentOwner === null) {
+      myTasks.push({ text, umbrella: classifyTaskUmbrella(text) });
+    } else if (currentOwner) {
+      teamTasks[currentOwner].push(text);
+    }
   }
+
   return { myTasks, teamTasks };
 }
 
@@ -1457,7 +1502,7 @@ function parseNotes() {
   const preview = document.getElementById('parsePreview');
   const total = myTasks.length + Object.values(teamTasks).flat().length;
   if (total === 0) {
-    preview.innerHTML = `<p style="color:#C4956A;font-style:italic;font-family:var(--serif);font-size:12.5px;margin-top:12px;text-align:center">No action items detected. Make sure your notes include a "Next Steps", "Riean Tasks", or "[Name] Tasks" section.</p>`;
+    preview.innerHTML = `<p style="color:#C4956A;font-style:italic;font-family:var(--serif);font-size:12.5px;margin-top:12px;text-align:center">No action items detected. Make sure your notes include a "Next Steps" or "Action Items" section with bullets underneath.</p>`;
     document.getElementById('modalFooter').style.display = 'none';
     return;
   }
