@@ -569,16 +569,25 @@
     background-repeat: no-repeat;
     background-position: center;
   }
-  .task-text { flex: 1; font-size: 13px; line-height: 1.45; color: var(--text); }
+  .task-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .task-text { font-size: 13px; line-height: 1.45; color: var(--text); }
   .task-text.done { text-decoration: line-through; color: #B0957A; }
+  .task-badges { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
   .task-meta { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
   .star-btn { background: none; border: none; cursor: pointer; font-size: 14px; color: #D4B896; transition: color .15s; padding: 0; }
   .star-btn.starred { color: #C4956A; }
   .star-btn:hover { color: #C4956A; }
   .del-btn { background: none; border: none; cursor: pointer; color: #E8D5BE; font-size: 16px; line-height: 1; padding: 0; transition: color .15s; }
   .del-btn:hover { color: #B87355; }
+  .due-btn { background: none; border: none; cursor: pointer; font-size: 12px; padding: 0; opacity: 0.35; transition: opacity .15s; line-height: 1; }
+  .due-btn:hover { opacity: 0.8; }
   .task-source { font-size: 10px; background: #F5EDE0; color: #A07050; padding: 1px 5px; border-radius: 4px; font-weight: 500; }
   .task-source.meeting { background: #EEF1FF; color: #5A6EE0; }
+  .task-source.recurring { background: #F0F7F0; color: #5A8E5E; }
+  .task-due { font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 4px; cursor: pointer; font-family: var(--sans); }
+  .task-due.overdue  { background: #FDECEA; color: #C0392B; }
+  .task-due.due-today { background: #FFF3E0; color: #B87355; }
+  .task-due.upcoming { background: #F5F0EA; color: #8B6347; }
 
   /* ── Progress ── */
   .progress-row { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); margin-bottom: 4px; font-style: italic; font-family: var(--serif); }
@@ -1125,19 +1134,20 @@ function loadState() {
   const defaults = {
     tasks: { product: [], fund: [], partner: [], market: [], meeting: [] },
     followups: [],
-    top3: [null, null, null]
+    top3: [null, null, null],
+    recurringDismissed: {}
   };
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (raw) {
       const saved = JSON.parse(raw);
-      // Ensure all task buckets exist (handles old saved states)
       saved.tasks = saved.tasks || {};
       ['product','fund','partner','market','meeting'].forEach(k => {
         if (!Array.isArray(saved.tasks[k])) saved.tasks[k] = [];
       });
       if (!Array.isArray(saved.followups)) saved.followups = [];
       if (!Array.isArray(saved.top3)) saved.top3 = [null, null, null];
+      if (typeof saved.recurringDismissed !== 'object' || !saved.recurringDismissed) saved.recurringDismissed = {};
       return saved;
     }
   } catch(e) {}
@@ -1170,6 +1180,92 @@ function classifyTaskUmbrella(text) {
   return 'meeting';
 }
 
+// ── Recurring tasks ───────────────────────────────────────────────
+const RECURRING_TASKS = [
+  { id: 'investor-update',   text: 'Send investor update',                         umbrella: 'fund',    schedule: { type: 'monthly', when: 'first-monday' } },
+  { id: 'financial-model',   text: 'Update financial model for prior month',        umbrella: 'fund',    schedule: { type: 'monthly', when: 'first-day'    } },
+  { id: 'investor-topics',   text: 'Ask team for investor update topics',           umbrella: 'fund',    schedule: { type: 'monthly', when: 'last-week'    } },
+  { id: 'app-metrics',       text: 'Check app metrics',                             umbrella: 'product', schedule: { type: 'weekly',  day: 1               } },
+  { id: 'content-metrics',   text: 'Check content metrics',                         umbrella: 'market',  schedule: { type: 'weekly',  day: 1               } },
+];
+
+function getFirstMondayOfMonth(d) {
+  const first = new Date(d.getFullYear(), d.getMonth(), 1);
+  const offset = (8 - first.getDay()) % 7; // days until Monday
+  return new Date(d.getFullYear(), d.getMonth(), 1 + offset);
+}
+
+function recurringPeriod(task, now = new Date()) {
+  const y = now.getFullYear(), m = String(now.getMonth()+1).padStart(2,'0');
+  if (task.schedule.type === 'weekly') return `${y}-W${String(getWeekNumber()).padStart(2,'0')}`;
+  return `${y}-${m}`;
+}
+
+function isRecurringDue(task, now = new Date()) {
+  const dow = now.getDay(), dom = now.getDate();
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
+  const { schedule } = task;
+  if (schedule.type === 'weekly')  return dow === schedule.day;
+  if (schedule.when === 'first-monday') {
+    const fm = getFirstMondayOfMonth(now);
+    const fmSun = new Date(fm); fmSun.setDate(fm.getDate() + 6);
+    return now >= fm && now <= fmSun;
+  }
+  if (schedule.when === 'first-day')  return dom <= 7;
+  if (schedule.when === 'last-week')  return dom >= daysInMonth - 6;
+  return false;
+}
+
+function checkRecurringTasks() {
+  const now = new Date();
+  if (!state.recurringDismissed) state.recurringDismissed = {};
+  let added = false;
+  for (const task of RECURRING_TASKS) {
+    if (!isRecurringDue(task, now)) continue;
+    const period = recurringPeriod(task, now);
+    if (state.recurringDismissed[task.id] === period) continue; // already done this period
+    const bucket = state.tasks[task.umbrella] || [];
+    if (bucket.some(t => t.recurringId === task.id)) continue; // already in board
+    if (!state.tasks[task.umbrella]) state.tasks[task.umbrella] = [];
+    state.tasks[task.umbrella].unshift({ text: task.text, done: false, starred: false, source: 'recurring', recurringId: task.id });
+    added = true;
+  }
+  if (added) saveState();
+}
+
+// ── Due date helpers ──────────────────────────────────────────────
+function formatDueDate(iso) {
+  if (!iso) return '';
+  const [y, m, d] = iso.split('-').map(Number);
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${months[m-1]} ${d}`;
+}
+
+function getDueBadgeClass(iso) {
+  if (!iso) return '';
+  const today = new Date(); today.setHours(0,0,0,0);
+  const due   = new Date(iso + 'T00:00:00');
+  if (due < today)  return 'overdue';
+  if (due.getTime() === today.getTime()) return 'due-today';
+  return 'upcoming';
+}
+
+function promptDueDate(umbrella, idx) {
+  const t = state.tasks[umbrella][idx];
+  const inp = document.createElement('input');
+  inp.type = 'date';
+  inp.value = t.dueDate || '';
+  inp.style.cssText = 'position:fixed;opacity:0;pointer-events:none;';
+  document.body.appendChild(inp);
+  inp.addEventListener('change', () => {
+    t.dueDate = inp.value || null;
+    saveState(); renderTasks(umbrella);
+    document.body.removeChild(inp);
+  });
+  inp.addEventListener('blur', () => { if (document.body.contains(inp)) document.body.removeChild(inp); });
+  inp.showPicker ? inp.showPicker() : inp.click();
+}
+
 // ── Task rendering ────────────────────────────────────────────────
 function renderTasks(umbrella) {
   const list = document.getElementById(`list-${umbrella}`);
@@ -1177,17 +1273,28 @@ function renderTasks(umbrella) {
   if (tasks.length === 0) {
     list.innerHTML = `<div class="empty-state">No tasks yet — add one below</div>`;
   } else {
-    list.innerHTML = tasks.map((t, i) => `
+    list.innerHTML = tasks.map((t, i) => {
+      const dueCls  = t.dueDate ? getDueBadgeClass(t.dueDate) : '';
+      const dueLabel = t.dueDate ? formatDueDate(t.dueDate) : '';
+      const badges = [
+        t.source === 'meeting'   ? `<span class="task-source meeting">meeting</span>` : '',
+        t.source === 'recurring' ? `<span class="task-source recurring">🔁 recurring</span>` : '',
+        t.dueDate ? `<span class="task-due ${dueCls}" onclick="promptDueDate('${umbrella}',${i})" title="Change due date">${dueCls === 'overdue' ? '⚠ overdue · ' : (dueCls === 'due-today' ? '· due today' : '')}${dueLabel}</span>` : '',
+      ].filter(Boolean).join('');
+      return `
       <li class="task-item" data-umbrella="${umbrella}" data-idx="${i}">
         <input type="checkbox" class="task-cb" onchange="toggleTask('${umbrella}',${i},this)">
-        <span class="task-text">${escHtml(t.text)}</span>
+        <div class="task-body">
+          <span class="task-text ${t.done ? 'done' : ''}">${escHtml(t.text)}</span>
+          ${badges ? `<div class="task-badges">${badges}</div>` : ''}
+        </div>
         <div class="task-meta">
-          ${t.source === 'meeting' ? `<span class="task-source meeting">meeting</span>` : ''}
+          <button class="due-btn" onclick="promptDueDate('${umbrella}',${i})" title="Set due date">📅</button>
           <button class="star-btn ${t.starred ? 'starred' : ''}" onclick="toggleStar('${umbrella}',${i})" title="Pin to Top 3">★</button>
           <button class="del-btn" onclick="deleteTask('${umbrella}',${i})">×</button>
         </div>
-      </li>
-    `).join('');
+      </li>`;
+    }).join('');
   }
   const total = tasks.length;
   const done  = tasks.filter(t => t.done).length;
@@ -1282,12 +1389,18 @@ function toggleTask(umbrella, idx, cb) {
     item.style.overflow = 'hidden';
   }
   setTimeout(() => {
-    // Remove from top3 if starred
     const t = state.tasks[umbrella] && state.tasks[umbrella][idx];
     if (!t) return;
+    // If recurring, mark this period as dismissed so it won't re-inject until next cycle
+    if (t.recurringId) {
+      const def = RECURRING_TASKS.find(r => r.id === t.recurringId);
+      if (def) {
+        if (!state.recurringDismissed) state.recurringDismissed = {};
+        state.recurringDismissed[t.recurringId] = recurringPeriod(def);
+      }
+    }
     state.top3 = state.top3.map(s => (s && s.umbrella === umbrella && s.idx === idx) ? null : s);
     state.tasks[umbrella].splice(idx, 1);
-    // Fix top3 indices
     state.top3 = state.top3.map(s => {
       if (!s || s.umbrella !== umbrella) return s;
       return s.idx > idx ? { ...s, idx: s.idx - 1 } : s;
@@ -1769,6 +1882,7 @@ function cycleTrend(id) {
 })();
 
 // ── Init ──────────────────────────────────────────────────────────
+checkRecurringTasks();
 renderKpis();
 renderAllTasks();
 renderFollowups();
